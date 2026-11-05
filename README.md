@@ -15,7 +15,7 @@ PowerShell print agent for Purcheo. Polls the server for label and thermal print
    The token is prompted for if `-Token` is not given. Use `-Credential` to run the service as a user instead of LocalSystem (needed for printers installed per-user).
 4. The agent reports its printers on first heartbeat; pick the printer in Purcheo.
 
-Remove with `.\Install-PurcheoPrintAgent.ps1 -Uninstall`.
+Uninstall with `.\Uninstall-PurcheoPrintAgent.ps1` (stops and deletes the service and removes `%ProgramData%\PurcheoPrintAgent`). Add `-KeepConfig` to keep `config.json`; re-running `Install-PurcheoPrintAgent.ps1` with no parameters then reinstalls using the saved server URL and token. Re-running the installer over an existing install also works as an upgrade.
 
 Files live in `%ProgramData%\PurcheoPrintAgent` (`config.json`, `agent.log`). `config.json` options: `ServerUrl`, `Token`, `SumatraPath`, `LogPath`, `SetPaperSize` (default `true`), `PrintSettings` (SumatraPDF print settings, default `noscale`).
 

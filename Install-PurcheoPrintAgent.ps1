@@ -1,10 +1,13 @@
 <#
 .SYNOPSIS
-    Installs (or removes) the Purcheo print agent as a Windows service.
+    Installs the Purcheo print agent as a Windows service. Safe to re-run to reinstall or upgrade.
 
 .EXAMPLE
     .\Install-PurcheoPrintAgent.ps1 -ServerUrl https://purcheo.example.com -SumatraPath C:\Tools\SumatraPDF.exe
-    .\Install-PurcheoPrintAgent.ps1 -Uninstall
+    .\Install-PurcheoPrintAgent.ps1    # reuses ServerUrl and Token from an existing config.json
+
+.NOTES
+    Remove with Uninstall-PurcheoPrintAgent.ps1 (add -KeepConfig to keep the token for a reinstall).
 
 .NOTES
     Run from an elevated Windows PowerShell 5.1 prompt. The service is a small .NET Framework host,
@@ -22,8 +25,7 @@ param(
     [string]$InstallDir = (Join-Path $env:ProgramData 'PurcheoPrintAgent'),
     [string]$ServiceName = 'PurcheoPrintAgent',
     [pscredential]$Credential,
-    [bool]$SetPaperSize = $true,
-    [switch]$Uninstall
+    [bool]$SetPaperSize = $true
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,18 +36,28 @@ function Remove-AgentService {
     if ($svc.Status -ne 'Stopped') { Stop-Service -Name $ServiceName -Force }
     & sc.exe delete $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed ($LASTEXITCODE)" }
-    # Let the SCM release the exe before it is overwritten or deleted.
-    Start-Sleep -Seconds 2
+    # A service open in services.msc stays marked for deletion until that window is closed.
+    for ($i = 0; $i -lt 10 -and (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        throw "Service '$ServiceName' is still marked for deletion. Close services.msc and retry."
+    }
 }
 
-if ($Uninstall) {
-    Remove-AgentService
-    if (Test-Path $InstallDir) { Remove-Item -Path $InstallDir -Recurse -Force }
-    Write-Host "Removed service '$ServiceName' and $InstallDir"
-    return
+function Copy-IfDifferent([string]$From, [string]$To) {
+    $dest = Resolve-Path -Path $To -ErrorAction SilentlyContinue
+    if ($dest -and ((Resolve-Path -Path $From).Path -eq $dest.Path)) { return }
+    Copy-Item -Path $From -Destination $To -Force
 }
 
 if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Run this script in Windows PowerShell 5.1 (powershell.exe), not PowerShell 7.' }
+
+$existingConfigPath = Join-Path $InstallDir 'config.json'
+if ((-not $ServerUrl -or -not $Token) -and (Test-Path $existingConfigPath)) {
+    $existing = Get-Content -Raw -Path $existingConfigPath | ConvertFrom-Json
+    if (-not $ServerUrl) { $ServerUrl = [string]$existing.ServerUrl }
+    if (-not $Token) { $Token = [string]$existing.Token }
+    Write-Host "Reusing settings from $existingConfigPath"
+}
 
 if (-not $ServerUrl) { $ServerUrl = Read-Host 'Purcheo server URL (e.g. https://purcheo.example.com)' }
 $ServerUrl = $ServerUrl.Trim().TrimEnd('/')
@@ -60,6 +72,7 @@ if (-not $Token) { throw 'Token is required' }
 
 if (-not $SumatraPath) {
     $candidates = @(
+        (Join-Path $InstallDir 'SumatraPDF.exe'),
         (Join-Path $PSScriptRoot 'SumatraPDF.exe'),
         (Join-Path $env:ProgramFiles 'SumatraPDF\SumatraPDF.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'SumatraPDF\SumatraPDF.exe'),
@@ -87,8 +100,8 @@ if ($Credential) { $acl += @('/grant:r', ('{0}:(OI)(CI)RX' -f $Credential.UserNa
 & icacls.exe $InstallDir @acl | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls failed ($LASTEXITCODE)" }
 
-Copy-Item -Path $agentSource -Destination (Join-Path $InstallDir 'PurcheoPrintAgent.ps1') -Force
-Copy-Item -Path $SumatraPath -Destination (Join-Path $InstallDir 'SumatraPDF.exe') -Force
+Copy-IfDifferent $agentSource (Join-Path $InstallDir 'PurcheoPrintAgent.ps1')
+Copy-IfDifferent $SumatraPath (Join-Path $InstallDir 'SumatraPDF.exe')
 
 [ordered]@{
     ServerUrl    = $ServerUrl
