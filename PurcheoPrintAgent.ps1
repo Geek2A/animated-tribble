@@ -29,6 +29,9 @@ $LogPath = if ($cfg.LogPath) { [string]$cfg.LogPath } else { Join-Path $PSScript
 # Set the driver's page size from the job's media size before printing; off = use the driver default.
 $SetPaperSize = if ($null -ne $cfg.SetPaperSize) { [bool]$cfg.SetPaperSize } else { $true }
 $PrintSettings = if ($cfg.PrintSettings) { [string]$cfg.PrintSettings } else { 'noscale' }
+# Labels are often designed a millimetre or so off the stock's catalogue size.
+$PaperToleranceMm = if ($null -ne $cfg.PaperToleranceMm) { [double]$cfg.PaperToleranceMm } else { 1.5 }
+$SumatraTimeoutSeconds = if ($cfg.SumatraTimeoutSeconds) { [int]$cfg.SumatraTimeoutSeconds } else { 60 }
 
 $PrinterCheckIntervalSeconds = 60
 $AuthBackoffSeconds = 60
@@ -160,7 +163,6 @@ function Resolve-PdfUrl([string]$PdfPath) {
 }
 
 $PsfNs = 'http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework'
-$PaperToleranceMm = 0.8
 $SpoolerWaitSeconds = 30
 
 # The paper sizes the printer's driver offers: name, size and the namespace its option name needs.
@@ -303,8 +305,14 @@ function Invoke-PrintJob($Job) {
 
         $started = Get-Date
         $args = @('-print-to', $printer, '-print-settings', $PrintSettings, '-silent', '-exit-when-done', $pdf)
-        $p = Start-Process -FilePath $SumatraPath -ArgumentList ($args | ForEach-Object { '"{0}"' -f $_ }) -Wait -PassThru -WindowStyle Hidden
-        Write-Log "SumatraPDF exited with code $($p.ExitCode) for printer '$printer' (settings: $PrintSettings)"
+        # No -Wait: it also waits for every process Sumatra starts, which can hold the job for minutes.
+        $p = Start-Process -FilePath $SumatraPath -ArgumentList ($args | ForEach-Object { '"{0}"' -f $_ }) -PassThru -WindowStyle Hidden
+        $null = $p.Handle  # keeps the exit code readable after the process ends
+        if (-not $p.WaitForExit($SumatraTimeoutSeconds * 1000)) {
+            try { $p.Kill() } catch { }
+            throw "SumatraPDF did not finish within $SumatraTimeoutSeconds s and was stopped"
+        }
+        Write-Log ("SumatraPDF exited with code {0} after {1:0.0} s for printer '{2}' (settings: {3})" -f $p.ExitCode, ((Get-Date) - $started).TotalSeconds, $printer, $PrintSettings)
         if ($p.ExitCode -ne 0) { throw "SumatraPDF exited with code $($p.ExitCode)" }
         Wait-SpoolerDone $printer $started
     } finally {
