@@ -262,6 +262,8 @@ function Get-ErrorDetail($ErrorRecord) {
 function Wait-SpoolerDone([string]$Printer, [datetime]$Since) {
     $deadline = (Get-Date).AddSeconds($SpoolerWaitSeconds)
     $seen = $false
+    $last = $null
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     while ((Get-Date) -lt $deadline) {
         try {
             $jobs = @(Get-PrintJob -PrinterName $Printer -ErrorAction Stop |
@@ -274,10 +276,15 @@ function Wait-SpoolerDone([string]$Printer, [datetime]$Since) {
         if ($failed) { throw "Windows print queue reports '$($failed.JobStatus)' for the job" }
         if ($jobs.Count -eq 0) {
             # A label can print and leave the queue before the first look.
-            if (-not $seen) { Write-Log "No job left in the Windows print queue for '$Printer' (already printed, or never queued)" }
+            if (-not $seen) {
+                Write-Log "No job left in the Windows print queue for '$Printer' (already printed, or never queued)"
+            } else {
+                Write-Log ("Windows print queue: job left the queue after {0:0.0} s ({1} bytes, {2} page(s), last status {3})" -f $watch.Elapsed.TotalSeconds, $last.Size, $last.TotalPages, $last.JobStatus)
+            }
             return
         }
         $seen = $true
+        $last = $jobs | Select-Object -First 1
         Start-Sleep -Milliseconds 500
     }
     $status = (Get-Printer -Name $Printer -ErrorAction SilentlyContinue).PrinterStatus
