@@ -27,5 +27,6 @@ Files live in `%ProgramData%\PurcheoPrintAgent` (`config.json`, `agent.log`). `c
 
 ## Tuning
 
-- Paper size: the agent sets a custom page size on the printer from `media_width_mm` x `media_height_mm` via a print ticket. If the driver rejects it, a warning is logged and the driver default is used; set `SetPaperSize` to `false` and configure the size in the driver instead.
+- Paper size: the agent reads the paper sizes the printer's driver offers, picks the one closest to the job's `media_width_mm` x `media_height_mm` (within 0.8 mm, either orientation) and sets it on the printer. The first job logs the driver's full list. If nothing matches, or Windows rejects it, a warning with the details is logged and the driver default is used; set `SetPaperSize` to `false` and choose the size in the driver instead.
+- Print check: after SumatraPDF hands the job over, the agent watches the Windows print queue and reports a failure if the job shows an error or stays queued for 30 s, instead of reporting success regardless.
 - Rotation and calibration are applied by the server; adjust them per agent and per device in Purcheo.

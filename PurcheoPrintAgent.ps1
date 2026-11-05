@@ -37,6 +37,7 @@ $TempDir = Join-Path ([IO.Path]::GetTempPath()) 'PurcheoPrintAgent'
 $script:PollInterval = 2
 $script:DefaultPrinter = $null
 $script:LastPaper = @{}
+$script:PaperListed = @{}
 $script:SentPrinters = $null
 # Lines wait here until the server accepts them, so an outage is backfilled with original timestamps.
 $LogBatchSize = 200
@@ -158,34 +159,127 @@ function Resolve-PdfUrl([string]$PdfPath) {
     return $uri.AbsoluteUri
 }
 
+$PsfNs = 'http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework'
+$PaperToleranceMm = 0.8
+$SpoolerWaitSeconds = 30
+
+# The paper sizes the printer's driver offers: name, size and the namespace its option name needs.
+function Get-PaperOptions([string]$Printer) {
+    Add-Type -AssemblyName System.Printing
+    $server = New-Object System.Printing.LocalPrintServer
+    $queue = $null
+    $reader = $null
+    try {
+        $queue = $server.GetPrintQueue($Printer)
+        $reader = New-Object IO.StreamReader($queue.GetPrintCapabilitiesAsXml())
+        $caps = New-Object Xml.XmlDocument
+        $caps.LoadXml($reader.ReadToEnd())
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($queue) { $queue.Dispose() }
+        $server.Dispose()
+    }
+    $nsm = New-Object Xml.XmlNamespaceManager($caps.NameTable)
+    $nsm.AddNamespace('psf', $PsfNs)
+    $feature = $caps.SelectSingleNode("//psf:Feature[@name='psk:PageMediaSize']", $nsm)
+    $options = @()
+    if (-not $feature) { return $options }
+    foreach ($o in $feature.SelectNodes('psf:Option', $nsm)) {
+        $w = $o.SelectSingleNode("psf:ScoredProperty[@name='psk:MediaSizeWidth']/psf:Value", $nsm)
+        $h = $o.SelectSingleNode("psf:ScoredProperty[@name='psk:MediaSizeHeight']/psf:Value", $nsm)
+        if (-not $w -or -not $h) { continue }  # custom-size ranges have no fixed size
+        $name = $o.GetAttribute('name')
+        $prefix = if ($name.Contains(':')) { $name.Split(':')[0] } else { '' }
+        $label = $o.SelectSingleNode("psf:Property[@name='psk:DisplayName']/psf:Value", $nsm)
+        $options += [pscustomobject]@{
+            Name      = $name
+            Display   = if ($label) { $label.InnerText } else { $name }
+            Prefix    = $prefix
+            Namespace = if ($prefix) { $o.GetNamespaceOfPrefix($prefix) } else { '' }
+            WidthMm   = [double]$w.InnerText / 1000
+            HeightMm  = [double]$h.InnerText / 1000
+        }
+    }
+    return $options
+}
+
+# Drivers list the same label either way round, so a size matches in both orientations.
+function Find-PaperOption($Options, [double]$WidthMm, [double]$HeightMm) {
+    $best = $null
+    $bestDistance = [double]::MaxValue
+    foreach ($o in $Options) {
+        $d1 = [math]::Max([math]::Abs($o.WidthMm - $WidthMm), [math]::Abs($o.HeightMm - $HeightMm))
+        $d2 = [math]::Max([math]::Abs($o.WidthMm - $HeightMm), [math]::Abs($o.HeightMm - $WidthMm))
+        $d = [math]::Min($d1, $d2)
+        if ($d -le $PaperToleranceMm -and $d -lt $bestDistance) { $best = $o; $bestDistance = $d }
+    }
+    return $best
+}
+
 function Set-PaperSize([string]$Printer, [double]$WidthMm, [double]$HeightMm) {
     $key = '{0}|{1}|{2}' -f $Printer, $WidthMm, $HeightMm
     if ($script:LastPaper[$Printer] -eq $key) { return }
 
-    $ptNs = 'http://schemas.microsoft.com/windows/2003/08/printing/printticket'
-    $widthUm = [int][math]::Round($WidthMm * 1000)
-    $heightUm = [int][math]::Round($HeightMm * 1000)
+    $options = @(Get-PaperOptions $Printer)
+    if (-not $script:PaperListed[$Printer]) {
+        $list = ($options | ForEach-Object { '{0} ({1:0.#}x{2:0.#} mm)' -f $_.Display, $_.WidthMm, $_.HeightMm }) -join '; '
+        Write-Log "Paper sizes offered by '$Printer': $list"
+        $script:PaperListed[$Printer] = $true
+    }
+    $match = Find-PaperOption $options $WidthMm $HeightMm
+    if (-not $match) {
+        throw ('The driver offers no paper size close to {0:0.##}x{1:0.##} mm' -f $WidthMm, $HeightMm)
+    }
 
-    $ticket = [xml](Get-PrintConfiguration -PrinterName $Printer).PrintTicketXml
+    $ticket = New-Object Xml.XmlDocument
+    $ticket.LoadXml((Get-PrintConfiguration -PrinterName $Printer).PrintTicketXml)
     $nsm = New-Object Xml.XmlNamespaceManager($ticket.NameTable)
-    $nsm.AddNamespace('pt', $ptNs)
+    $nsm.AddNamespace('psf', $PsfNs)
     $root = $ticket.DocumentElement
-    $old = $root.SelectSingleNode("pt:Feature[@name='psk:PageMediaSize']", $nsm)
+    $old = $root.SelectSingleNode("psf:Feature[@name='psk:PageMediaSize']", $nsm)
     if ($old) { [void]$root.RemoveChild($old) }
 
+    $extraNs = if ($match.Prefix -and $match.Prefix -ne 'psk') { ' xmlns:{0}="{1}"' -f $match.Prefix, $match.Namespace } else { '' }
     $frag = $ticket.CreateDocumentFragment()
-    $frag.InnerXml = @"
-<Feature xmlns="$ptNs" xmlns:psk="http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" name="psk:PageMediaSize">
-  <Option name="psk:CustomMediaSize">
-    <ScoredProperty name="psk:MediaSizeWidth"><Value xsi:type="xsd:integer">$widthUm</Value></ScoredProperty>
-    <ScoredProperty name="psk:MediaSizeHeight"><Value xsi:type="xsd:integer">$heightUm</Value></ScoredProperty>
-  </Option>
-</Feature>
-"@
+    $frag.InnerXml = '<psf:Feature xmlns:psf="{0}" xmlns:psk="http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords"{1} name="psk:PageMediaSize"><psf:Option name="{2}" /></psf:Feature>' -f $PsfNs, $extraNs, $match.Name
     [void]$root.AppendChild($frag)
     Set-PrintConfiguration -PrinterName $Printer -PrintTicketXml $ticket.OuterXml
     $script:LastPaper[$Printer] = $key
-    Write-Log "Paper size for '$Printer' set to $WidthMm x $HeightMm mm"
+    Write-Log ("Paper size for '{0}' set to {1} ({2:0.#}x{3:0.#} mm)" -f $Printer, $match.Display, $match.WidthMm, $match.HeightMm)
+}
+
+function Get-ErrorDetail($ErrorRecord) {
+    $parts = @($ErrorRecord.Exception.Message)
+    $inner = $ErrorRecord.Exception.InnerException
+    while ($inner) { $parts += $inner.Message; $inner = $inner.InnerException }
+    if ($ErrorRecord.FullyQualifiedErrorId) { $parts += "[$($ErrorRecord.FullyQualifiedErrorId)]" }
+    return ($parts | Select-Object -Unique) -join ' | '
+}
+
+# SumatraPDF exits 0 once the job is handed to Windows, so check that the spooler really took it.
+function Wait-SpoolerDone([string]$Printer, [datetime]$Since) {
+    $deadline = (Get-Date).AddSeconds($SpoolerWaitSeconds)
+    $seen = $false
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $jobs = @(Get-PrintJob -PrinterName $Printer -ErrorAction Stop |
+                Where-Object { $_.SubmittedTime -ge $Since.AddSeconds(-5) })
+        } catch {
+            Write-Log "Could not read the Windows print queue: $($_.Exception.Message)" 'WARNING'
+            return
+        }
+        $failed = $jobs | Where-Object { "$($_.JobStatus)" -match 'Error|Offline|PaperOut|Blocked|UserIntervention' } | Select-Object -First 1
+        if ($failed) { throw "Windows print queue reports '$($failed.JobStatus)' for the job" }
+        if ($jobs.Count -eq 0) {
+            # A label can print and leave the queue before the first look.
+            if (-not $seen) { Write-Log "No job left in the Windows print queue for '$Printer' (already printed, or never queued)" }
+            return
+        }
+        $seen = $true
+        Start-Sleep -Milliseconds 500
+    }
+    $status = (Get-Printer -Name $Printer -ErrorAction SilentlyContinue).PrinterStatus
+    throw "The job was still in the Windows print queue after $SpoolerWaitSeconds s (printer status: $status)"
 }
 
 function Invoke-PrintJob($Job) {
@@ -204,12 +298,15 @@ function Invoke-PrintJob($Job) {
 
         if ($SetPaperSize -and $Job.media_width_mm -and $Job.media_height_mm) {
             try { Set-PaperSize $printer ([double]$Job.media_width_mm) ([double]$Job.media_height_mm) }
-            catch { Write-Log "Could not set paper size, using driver default: $($_.Exception.Message)" 'WARN' }
+            catch { Write-Log "Could not set paper size, using driver default: $(Get-ErrorDetail $_)" 'WARNING' }
         }
 
+        $started = Get-Date
         $args = @('-print-to', $printer, '-print-settings', $PrintSettings, '-silent', '-exit-when-done', $pdf)
         $p = Start-Process -FilePath $SumatraPath -ArgumentList ($args | ForEach-Object { '"{0}"' -f $_ }) -Wait -PassThru -WindowStyle Hidden
+        Write-Log "SumatraPDF exited with code $($p.ExitCode) for printer '$printer' (settings: $PrintSettings)"
         if ($p.ExitCode -ne 0) { throw "SumatraPDF exited with code $($p.ExitCode)" }
+        Wait-SpoolerDone $printer $started
     } finally {
         Remove-Item -Path $pdf -Force -ErrorAction SilentlyContinue
     }
