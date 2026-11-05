@@ -137,7 +137,7 @@ function Send-PendingLogs {
         $n = [math]::Min($LogBatchSize, $script:LogQueue.Count)
         $batch = $script:LogQueue.GetRange(0, $n).ToArray()
         try {
-            [void](Invoke-Api -Method POST -Url "$BaseUrl/api/print-agent/logs/" -Body @{ lines = $batch })
+            [void](Invoke-Api -Method POST -Url "$BaseUrl/api/print-agent/logs/" -Body @{ entries = $batch })
         } catch {
             if ((Get-ErrorStatus $_) -ne 400) { throw }
             # A batch the server rejects outright would otherwise block the queue forever.
@@ -198,7 +198,7 @@ function Invoke-PrintJob($Job) {
     if (-not (Test-Path $SumatraPath)) { throw "SumatraPDF not found at $SumatraPath" }
 
     if (-not (Test-Path $TempDir)) { [void](New-Item -ItemType Directory -Path $TempDir) }
-    $pdf = Join-Path $TempDir ("job-{0}.pdf" -f ([int]$Job.id))
+    $pdf = Join-Path $TempDir ("job-{0}.pdf" -f $Job.id)
     try {
         [void](Invoke-Api -Method GET -Url (Resolve-PdfUrl ([string]$Job.pdf_path)) -OutFile $pdf)
 
@@ -215,7 +215,7 @@ function Invoke-PrintJob($Job) {
     }
 }
 
-function Send-JobResult([int]$JobId, [bool]$Success, [string]$ErrorText) {
+function Send-JobResult([string]$JobId, [bool]$Success, [string]$ErrorText) {
     $body = @{ success = $Success }
     if (-not $Success) { $body.error = $ErrorText }
     for ($i = 1; $i -le 3; $i++) {
@@ -243,14 +243,16 @@ while ($true) {
         $r = Invoke-Api -Method GET -Url "$BaseUrl/api/print-agent/jobs/next/"
         if ($r.Status -ne 204 -and $r.Json -and $r.Json.job) {
             $job = $r.Json.job
-            Write-Log "Job $($job.id): '$($job.title)' $($job.pages) page(s) $($job.media_width_mm)x$($job.media_height_mm)mm" 'INFO' @{ job_id = [int]$job.id }
+            # Job ids are UUIDs; parsing also keeps odd values out of file names and URLs.
+            $job.id = ([guid][string]$job.id).ToString()
+            Write-Log "Job $($job.id): '$($job.title)' $($job.pages) page(s) $($job.media_width_mm)x$($job.media_height_mm)mm" 'INFO' @{ job_id = $job.id }
             try {
                 Invoke-PrintJob $job
-                Send-JobResult ([int]$job.id) $true $null
-                Write-Log "Job $($job.id) printed" 'INFO' @{ job_id = [int]$job.id }
+                Send-JobResult $job.id $true $null
+                Write-Log "Job $($job.id) printed" 'INFO' @{ job_id = $job.id }
             } catch {
-                Write-Log "Job $($job.id) failed: $($_.Exception.Message)" 'ERROR' @{ job_id = [int]$job.id }
-                Send-JobResult ([int]$job.id) $false $_.Exception.Message
+                Write-Log "Job $($job.id) failed: $($_.Exception.Message)" 'ERROR' @{ job_id = $job.id }
+                Send-JobResult $job.id $false $_.Exception.Message
             }
             $delay = 0  # check for another job immediately
         }
