@@ -4,7 +4,8 @@
 
 .EXAMPLE
     .\Install-PurcheoPrintAgent.ps1 -ServerUrl https://purcheo.example.com -SumatraPath C:\Tools\SumatraPDF.exe
-    .\Install-PurcheoPrintAgent.ps1    # reuses ServerUrl and Token from an existing config.json
+    .\Install-PurcheoPrintAgent.ps1 -UpdateToken github_pat_...   # only needed if the GitHub repo is private
+    .\Install-PurcheoPrintAgent.ps1    # reuses the existing config.json (all options are kept)
 
 .NOTES
     Remove with Uninstall-PurcheoPrintAgent.ps1 (add -KeepConfig to keep the token for a reinstall).
@@ -21,6 +22,7 @@
 param(
     [string]$ServerUrl,
     [string]$Token,
+    [string]$UpdateToken,
     [string]$SumatraPath,
     [string]$InstallDir = (Join-Path $env:ProgramData 'PurcheoPrintAgent'),
     [string]$ServiceName = 'PurcheoPrintAgent',
@@ -52,11 +54,12 @@ function Copy-IfDifferent([string]$From, [string]$To) {
 if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Run this script in Windows PowerShell 5.1 (powershell.exe), not PowerShell 7.' }
 
 $existingConfigPath = Join-Path $InstallDir 'config.json'
-if ((-not $ServerUrl -or -not $Token) -and (Test-Path $existingConfigPath)) {
+$existing = $null
+if (Test-Path $existingConfigPath) {
     $existing = Get-Content -Raw -Path $existingConfigPath | ConvertFrom-Json
+    if (-not $ServerUrl -or -not $Token) { Write-Host "Reusing settings from $existingConfigPath" }
     if (-not $ServerUrl) { $ServerUrl = [string]$existing.ServerUrl }
     if (-not $Token) { $Token = [string]$existing.Token }
-    Write-Host "Reusing settings from $existingConfigPath"
 }
 
 if (-not $ServerUrl) { $ServerUrl = Read-Host 'Purcheo server URL (e.g. https://purcheo.example.com)' }
@@ -103,13 +106,16 @@ if ($LASTEXITCODE -ne 0) { throw "icacls failed ($LASTEXITCODE)" }
 Copy-IfDifferent $agentSource (Join-Path $InstallDir 'PurcheoPrintAgent.ps1')
 Copy-IfDifferent $SumatraPath (Join-Path $InstallDir 'SumatraPDF.exe')
 
-[ordered]@{
-    ServerUrl    = $ServerUrl
-    Token        = $Token
-    SumatraPath  = (Join-Path $InstallDir 'SumatraPDF.exe')
-    LogPath      = (Join-Path $InstallDir 'agent.log')
-    SetPaperSize = $SetPaperSize
-} | ConvertTo-Json | Set-Content -Path (Join-Path $InstallDir 'config.json') -Encoding UTF8
+# Start from the existing config so options set by hand (PrintSettings, UpdateToken, ...) survive a reinstall.
+$config = [ordered]@{}
+if ($existing) { foreach ($p in $existing.PSObject.Properties) { $config[$p.Name] = $p.Value } }
+$config.ServerUrl = $ServerUrl
+$config.Token = $Token
+$config.SumatraPath = (Join-Path $InstallDir 'SumatraPDF.exe')
+$config.LogPath = (Join-Path $InstallDir 'agent.log')
+if ($PSBoundParameters.ContainsKey('SetPaperSize') -or -not $config.Contains('SetPaperSize')) { $config.SetPaperSize = $SetPaperSize }
+if ($UpdateToken) { $config.UpdateToken = $UpdateToken }
+$config | ConvertTo-Json | Set-Content -Path (Join-Path $InstallDir 'config.json') -Encoding UTF8
 
 $hostSource = @'
 using System;

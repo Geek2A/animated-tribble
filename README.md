@@ -17,7 +17,13 @@ PowerShell print agent for Purcheo. Polls the server for label and thermal print
 
 Uninstall with `.\Uninstall-PurcheoPrintAgent.ps1` (stops and deletes the service and removes `%ProgramData%\PurcheoPrintAgent`). Add `-KeepConfig` to keep `config.json`; re-running `Install-PurcheoPrintAgent.ps1` with no parameters then reinstalls using the saved server URL and token. Re-running the installer over an existing install also works as an upgrade.
 
-Files live in `%ProgramData%\PurcheoPrintAgent` (`config.json`, `agent.log`). `config.json` options: `ServerUrl`, `Token`, `SumatraPath`, `LogPath`, `SetPaperSize` (default `true`), `PrintSettings` (SumatraPDF print settings, default `noscale`), `PaperToleranceMm` (how far a driver paper size may differ from the label, default `1.5`), `SumatraTimeoutSeconds` (default `60`).
+Files live in `%ProgramData%\PurcheoPrintAgent` (`config.json`, `agent.log`). `config.json` options: `ServerUrl`, `Token`, `SumatraPath`, `LogPath`, `SetPaperSize` (default `true`), `PrintSettings` (SumatraPDF print settings, default `noscale`), `PaperToleranceMm` (how far a driver paper size may differ from the label, default `1.5`), `SumatraTimeoutSeconds` (default `60`), `UpdateToken`, `UpdateRepo` (default `Geek2A/animated-tribble`), `UpdateBranch` (default `main`), `AutoUpdate` (default `true`), `UpdateCheckIntervalMinutes` (default `60`), `UpdateBackoffHours` (default `24`). Re-running the installer keeps every option already in `config.json`.
+
+## Auto-update
+
+The agent checks GitHub at startup and then every `UpdateCheckIntervalMinutes`. If `PurcheoPrintAgent.ps1` on the branch differs from the installed copy and parses cleanly, it replaces it (keeping `PurcheoPrintAgent.ps1.bak`) and exits so the service host restarts it; `config.json` is untouched. Checks happen between jobs, never during one.
+
+No credentials are needed while the repo is public. If GitHub answers 401, 403 or 404 (for example once the repo is private again), the agent logs nothing and stops checking for `UpdateBackoffHours`. To keep updating from a private repo, create a fine-grained personal access token limited to this repository with read-only `Contents` permission and install it with `.\Install-PurcheoPrintAgent.ps1 -UpdateToken <token>` (or add `UpdateToken` to `config.json` and restart the service). The token is stored in `config.json`, which only SYSTEM and Administrators can read. Set `AutoUpdate` to `false` to turn updating off. The agent runs whatever is on the branch as LocalSystem, so protect `main`. Changes to the installer or the service host are not applied automatically; re-run the installer for those.
 
 ## Testing without the service
 

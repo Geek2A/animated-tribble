@@ -18,7 +18,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$AgentVersion = '1.0.0'
+$AgentVersion = '1.1.0'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $cfg = Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json
@@ -32,6 +32,14 @@ $PrintSettings = if ($cfg.PrintSettings) { [string]$cfg.PrintSettings } else { '
 # Labels are often designed a millimetre or so off the stock's catalogue size.
 $PaperToleranceMm = if ($null -ne $cfg.PaperToleranceMm) { [double]$cfg.PaperToleranceMm } else { 1.5 }
 $SumatraTimeoutSeconds = if ($cfg.SumatraTimeoutSeconds) { [int]$cfg.SumatraTimeoutSeconds } else { 60 }
+# Self-update from GitHub. A private or missing repo (401/403/404) is not an error: updating pauses for UpdateBackoffHours.
+$UpdateRepo = if ($cfg.UpdateRepo) { [string]$cfg.UpdateRepo } else { 'Geek2A/animated-tribble' }
+$UpdateBranch = if ($cfg.UpdateBranch) { [string]$cfg.UpdateBranch } else { 'main' }
+$UpdateToken = [string]$cfg.UpdateToken
+$AutoUpdate = if ($null -ne $cfg.AutoUpdate) { [bool]$cfg.AutoUpdate } else { $true }
+$UpdateCheckIntervalMinutes = if ($cfg.UpdateCheckIntervalMinutes) { [double]$cfg.UpdateCheckIntervalMinutes } else { 60 }
+$UpdateBackoffHours = if ($cfg.UpdateBackoffHours) { [double]$cfg.UpdateBackoffHours } else { 24 }
+$script:NextUpdateCheck = Get-Date
 
 $PrinterCheckIntervalSeconds = 60
 $AuthBackoffSeconds = 60
@@ -327,6 +335,41 @@ function Invoke-PrintJob($Job) {
     }
 }
 
+# Replaces this script with the branch's copy when it differs; the service host restarts the agent afterwards.
+function Update-AgentIfNewer {
+    if (-not (Test-Path $TempDir)) { [void](New-Item -ItemType Directory -Path $TempDir) }
+    $new = Join-Path $TempDir 'PurcheoPrintAgent.ps1.new'
+    $headers = @{ Accept = 'application/vnd.github.raw'; 'User-Agent' = 'PurcheoPrintAgent' }
+    if ($UpdateToken) { $headers.Authorization = "Bearer $UpdateToken" }
+    try {
+        try {
+            Invoke-WebRequest -Uri "https://api.github.com/repos/$UpdateRepo/contents/PurcheoPrintAgent.ps1?ref=$UpdateBranch" `
+                -Headers $headers -OutFile $new -UseBasicParsing -TimeoutSec 60
+        } catch {
+            $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+            if ($status -in 401, 403, 404) {
+                $script:NextUpdateCheck = (Get-Date).AddHours($UpdateBackoffHours)
+                return $false
+            }
+            throw
+        }
+        if ((Get-Item $new).Length -eq 0) { throw 'downloaded file is empty' }
+        if ((Get-FileHash -Path $new -Algorithm SHA256).Hash -eq (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash) { return $false }
+
+        # Never install a copy that does not parse: the service would restart into it forever.
+        $parseErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseFile($new, [ref]$null, [ref]$parseErrors)
+        if ($parseErrors.Count -gt 0) { throw "downloaded script has syntax errors: $($parseErrors[0].Message)" }
+
+        Copy-Item -Path $PSCommandPath -Destination "$PSCommandPath.bak" -Force
+        Copy-Item -Path $new -Destination $PSCommandPath -Force
+        Write-Log "Updated agent from $UpdateRepo@$UpdateBranch (was $AgentVersion); restarting"
+        return $true
+    } finally {
+        Remove-Item -Path $new -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Send-JobResult([string]$JobId, [bool]$Success, [string]$ErrorText) {
     $body = @{ success = $Success }
     if (-not $Success) { $body.error = $ErrorText }
@@ -346,6 +389,17 @@ $lastPrinterCheck = [datetime]::MinValue
 
 while ($true) {
     $delay = $script:PollInterval
+    if ($AutoUpdate -and (Get-Date) -ge $script:NextUpdateCheck) {
+        $script:NextUpdateCheck = (Get-Date).AddMinutes($UpdateCheckIntervalMinutes)
+        try {
+            if (Update-AgentIfNewer) {
+                try { Send-PendingLogs } catch { }
+                exit 0
+            }
+        } catch {
+            Write-Log "Update check failed: $(Get-ErrorDetail $_)" 'WARNING' -NoShip
+        }
+    }
     try {
         if (((Get-Date) - $lastPrinterCheck).TotalSeconds -ge $PrinterCheckIntervalSeconds) {
             Send-HeartbeatIfChanged
