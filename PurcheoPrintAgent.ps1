@@ -18,7 +18,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$AgentVersion = '1.1.0'
+$AgentVersion = '1.1.1'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $cfg = Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json
