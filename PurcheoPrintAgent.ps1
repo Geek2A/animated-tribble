@@ -32,6 +32,10 @@ $PrintSettings = if ($cfg.PrintSettings) { [string]$cfg.PrintSettings } else { '
 # Labels are often designed a millimetre or so off the stock's catalogue size.
 $PaperToleranceMm = if ($null -ne $cfg.PaperToleranceMm) { [double]$cfg.PaperToleranceMm } else { 1.5 }
 $SumatraTimeoutSeconds = if ($cfg.SumatraTimeoutSeconds) { [int]$cfg.SumatraTimeoutSeconds } else { 60 }
+# Labels sent straight after another can be dropped while the printer is still feeding.
+$JobSettleSeconds = if ($null -ne $cfg.JobSettleSeconds) { [double]$cfg.JobSettleSeconds } else { 2 }
+$PrinterReadyWaitSeconds = if ($cfg.PrinterReadyWaitSeconds) { [int]$cfg.PrinterReadyWaitSeconds } else { 15 }
+$PrinterWatchIntervalSeconds = 15
 # Self-update from GitHub. A private or missing repo (401/403/404) is not an error: updating pauses for UpdateBackoffHours.
 $UpdateRepo = if ($cfg.UpdateRepo) { [string]$cfg.UpdateRepo } else { 'Geek2A/animated-tribble' }
 $UpdateBranch = if ($cfg.UpdateBranch) { [string]$cfg.UpdateBranch } else { 'main' }
@@ -49,6 +53,10 @@ $script:PollInterval = 2
 $script:DefaultPrinter = $null
 $script:LastPaper = @{}
 $script:PaperListed = @{}
+$script:CurrentJobId = $null
+$script:LastJobEnd = [datetime]::MinValue
+$script:LastPrinterSummary = $null
+$script:NextPrinterWatch = Get-Date
 $script:SentPrinters = $null
 # Lines wait here until the server accepts them, so an outage is backfilled with original timestamps.
 $LogBatchSize = 200
@@ -67,6 +75,10 @@ function Write-Log([string]$Message, [string]$Level = 'INFO', [hashtable]$Data =
         Add-Content -Path $LogPath -Value $line -Encoding UTF8
     } catch { }
     if ($NoShip) { return }
+    if ($script:CurrentJobId) {
+        $Data = if ($Data) { $Data.Clone() } else { @{} }
+        if (-not $Data.ContainsKey('job_id')) { $Data['job_id'] = $script:CurrentJobId }
+    }
     $text = if ($Message) { $Message } else { '(empty)' }
     if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) }
     $entry = [ordered]@{
@@ -299,6 +311,91 @@ function Wait-SpoolerDone([string]$Printer, [datetime]$Since) {
     throw "The job was still in the Windows print queue after $SpoolerWaitSeconds s (printer status: $status)"
 }
 
+$DetectedErrorNames = @{
+    0 = 'unknown'; 1 = 'other'; 2 = 'no error'; 3 = 'low paper'; 4 = 'no paper'; 5 = 'low toner'
+    6 = 'no toner'; 7 = 'door open'; 8 = 'jammed'; 9 = 'offline'; 10 = 'service requested'; 11 = 'output bin full'
+}
+$BlockingStatus = 'Error|Offline|PaperOut|PaperJam|PaperProblem|DoorOpen|UserIntervention|NotAvailable|NoToner|OutOfMemory'
+# Offline can flicker on a printer that has just gone idle, so only these fail a job after the fact.
+$HardStatus = 'Error|PaperOut|PaperJam|DoorOpen|UserIntervention|NoToner'
+$BusyStatus = 'Printing|Busy|Processing|IOActive|Initializing|WarmingUp'
+
+# What Windows knows about the printer's physical state.
+function Get-PrinterState([string]$Printer) {
+    $p = Get-Printer -Name $Printer -ErrorAction SilentlyContinue
+    $cim = Get-CimInstance -ClassName Win32_Printer -Filter ("Name='{0}'" -f $Printer.Replace('\', '\\').Replace("'", "''")) -ErrorAction SilentlyContinue
+    $status = if ($p) { [string]$p.PrinterStatus } else { 'NotFound' }
+    $detected = $null
+    if ($cim -and $null -ne $cim.DetectedErrorState) { $detected = $DetectedErrorNames[[int]$cim.DetectedErrorState] }
+    $offline = [bool]($cim -and $cim.WorkOffline)
+    $summary = "status $status"
+    if ($offline) { $summary += ', set to work offline' }
+    if ($detected -and $detected -ne 'no error' -and $detected -ne 'unknown') { $summary += ", $detected" }
+    $blocked = $offline -or ($status -match $BlockingStatus) -or ($detected -in @('no paper', 'door open', 'jammed', 'offline'))
+    $hard = ($status -match $HardStatus) -or ($detected -in @('no paper', 'door open', 'jammed'))
+    [pscustomobject]@{ Status = $status; Summary = $summary; Blocked = $blocked; Hard = $hard; Busy = ($status -match $BusyStatus) }
+}
+
+# Waits until the printer is idle and healthy, and long enough after the previous label.
+function Wait-PrinterReady([string]$Printer) {
+    $settle = $script:LastJobEnd.AddSeconds($JobSettleSeconds) - (Get-Date)
+    if ($settle.TotalMilliseconds -gt 0) { Start-Sleep -Milliseconds ([int]$settle.TotalMilliseconds) }
+    $deadline = (Get-Date).AddSeconds($PrinterReadyWaitSeconds)
+    $busyDeadline = (Get-Date).AddSeconds(5)
+    $state = Get-PrinterState $Printer
+    while (($state.Blocked -and (Get-Date) -lt $deadline) -or ($state.Busy -and (Get-Date) -lt $busyDeadline)) {
+        Start-Sleep -Seconds 1
+        $state = Get-PrinterState $Printer
+    }
+    Write-Log "Printer '$Printer' before the job: $($state.Summary)"
+    if ($state.Blocked) { throw "Printer '$Printer' is not ready: $($state.Summary)" }
+}
+
+# A label that never comes out often leaves the printer in an error state a moment later.
+function Confirm-PrinterAfter([string]$Printer) {
+    Start-Sleep -Seconds 2
+    $state = Get-PrinterState $Printer
+    Write-Log "Printer '$Printer' after the job: $($state.Summary)" $(if ($state.Blocked) { 'WARNING' } else { 'INFO' })
+    if ($state.Hard) { throw "Printer '$Printer' reports a problem after printing: $($state.Summary)" }
+}
+
+# Logs only changes, so a printer that goes offline or runs out of labels shows up with its time.
+function Watch-PrinterState {
+    if ((Get-Date) -lt $script:NextPrinterWatch -or -not $script:DefaultPrinter) { return }
+    $script:NextPrinterWatch = (Get-Date).AddSeconds($PrinterWatchIntervalSeconds)
+    $state = Get-PrinterState $script:DefaultPrinter
+    if ($state.Summary -eq $script:LastPrinterSummary) { return }
+    $level = if ($state.Blocked) { 'WARNING' } else { 'INFO' }
+    $was = if ($script:LastPrinterSummary) { $script:LastPrinterSummary } else { 'not checked yet' }
+    Write-Log "Printer '$($script:DefaultPrinter)' state changed: $was -> $($state.Summary)" $level
+    $script:LastPrinterSummary = $state.Summary
+}
+
+# Windows' own print service errors since the job started (the Admin log is on by default).
+function Write-PrintServiceErrors([datetime]$Since) {
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PrintService/Admin'; StartTime = $Since.AddSeconds(-2) } -ErrorAction Stop |
+            Where-Object { $_.Level -le 3 } | Select-Object -First 5)
+    } catch { return }  # no events (or no access) is the normal case
+    foreach ($e in $events) {
+        $text = ([string]$e.Message) -replace '\s+', ' '
+        if ($text.Length -gt 300) { $text = $text.Substring(0, 300) }
+        Write-Log "Windows print service event $($e.Id): $text" 'WARNING'
+    }
+}
+
+function Test-DownloadedDocument([string]$Path, $Job) {
+    $actual = (Get-Item $Path).Length
+    if ($Job.size_bytes -and $actual -ne [int64]$Job.size_bytes) {
+        throw "Downloaded document is $actual bytes but the server sent $($Job.size_bytes)"
+    }
+    if ($Job.sha256) {
+        $hash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($hash -ne ([string]$Job.sha256).ToLowerInvariant()) { throw 'Downloaded document does not match the server checksum' }
+    }
+    Write-Log "Downloaded the document: $actual bytes$(if ($Job.sha256) { ', checksum matches' })"
+}
+
 function Invoke-PrintJob($Job) {
     $printer = [string]$Job.printer_name
     if (-not $printer) { $printer = $script:DefaultPrinter }
@@ -307,11 +404,13 @@ function Invoke-PrintJob($Job) {
         throw "Printer '$printer' not found on this machine"
     }
     if (-not (Test-Path $SumatraPath)) { throw "SumatraPDF not found at $SumatraPath" }
+    Wait-PrinterReady $printer
 
     if (-not (Test-Path $TempDir)) { [void](New-Item -ItemType Directory -Path $TempDir) }
     $pdf = Join-Path $TempDir ("job-{0}.pdf" -f $Job.id)
     try {
         [void](Invoke-Api -Method GET -Url (Resolve-PdfUrl ([string]$Job.pdf_path)) -OutFile $pdf)
+        Test-DownloadedDocument $pdf $Job
 
         if ($SetPaperSize -and $Job.media_width_mm -and $Job.media_height_mm) {
             try { Set-PaperSize $printer ([double]$Job.media_width_mm) ([double]$Job.media_height_mm) }
@@ -329,8 +428,10 @@ function Invoke-PrintJob($Job) {
         }
         Write-Log ("SumatraPDF exited with code {0} after {1:0.0} s for printer '{2}' (settings: {3})" -f $p.ExitCode, ((Get-Date) - $started).TotalSeconds, $printer, $PrintSettings)
         if ($p.ExitCode -ne 0) { throw "SumatraPDF exited with code $($p.ExitCode)" }
-        Wait-SpoolerDone $printer $started
+        try { Wait-SpoolerDone $printer $started } finally { Write-PrintServiceErrors $started }
+        Confirm-PrinterAfter $printer
     } finally {
+        $script:LastJobEnd = Get-Date
         Remove-Item -Path $pdf -Force -ErrorAction SilentlyContinue
     }
 }
@@ -405,12 +506,14 @@ while ($true) {
             Send-HeartbeatIfChanged
             $lastPrinterCheck = Get-Date
         }
+        Watch-PrinterState
 
         $r = Invoke-Api -Method GET -Url "$BaseUrl/api/print-agent/jobs/next/"
         if ($r.Status -ne 204 -and $r.Json -and $r.Json.job) {
             $job = $r.Json.job
             # Job ids are UUIDs; parsing also keeps odd values out of file names and URLs.
             $job.id = ([guid][string]$job.id).ToString()
+            $script:CurrentJobId = $job.id
             Write-Log "Job $($job.id): '$($job.title)' $($job.pages) page(s) $($job.media_width_mm)x$($job.media_height_mm)mm" 'INFO' @{ job_id = $job.id }
             try {
                 Invoke-PrintJob $job
@@ -419,6 +522,8 @@ while ($true) {
             } catch {
                 Write-Log "Job $($job.id) failed: $($_.Exception.Message)" 'ERROR' @{ job_id = $job.id }
                 Send-JobResult $job.id $false $_.Exception.Message
+            } finally {
+                $script:CurrentJobId = $null
             }
             $delay = 0  # check for another job immediately
         }
